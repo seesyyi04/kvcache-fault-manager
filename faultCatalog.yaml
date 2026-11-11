@@ -1,0 +1,432 @@
+key:
+  id: short code, e.g. F-01
+  name: name of the fault
+  category: [block_management, kv_transfer, kv_layout, communication, hardware, worker_failure, scheduling]
+  fault_site: component where the fault originates or resides
+  preconditions: features/config required to trigger it (e.g. prefix_caching, cpu_offload, spec_decode, pd_disagg, hybrid_model)
+  blast_radius: [token, request, prefix_sharing_requests, replica_or_tp_group, cluster]
+  persistence: [transient, intermittent, permanent]
+  manifestation: [crash, hang, silent, slow]
+  severity: [correctness, availability, latency]
+  detection_signal: what could reveal this fault
+  references: papers, bug reports, postmortems
+  evidence: [confirmed, observed, hypothesized]
+  existing_mitigation: how it is handled today, if at all
+  injectable_in_vllm: yes/no + rough injection method
+
+faults:
+  FID_01:
+    name: Asymmetry in data read and write
+    category: kv_layout
+    cause: >
+      The code path that writes KV into the cache and the code path that
+      reads it assume different physical layouts. Because each side derives
+      offsets independently (from formulas, strides, or kernel-specific
+      conventions), a mismatch places KV values, or their quantization
+      scales, at positions or in an order the reader does not expect. The
+      reader decodes the misplaced bytes as valid KV.
+    fault_site: KV-cache write path (cache write kernel) and its layout contract with the attention read path
+    preconditions: [writer_and_reader_use_independent_layout_logic]
+    blast_radius: replica_or_tp_group
+    persistence: permanent
+    manifestation: [silent]
+    severity: [correctness]
+    detection_signal: >
+      Writer-to-reader round-trip error above the expected floor for the KV
+      dtype (near zero for bf16, small for fp8, about 0.09 relative for
+      NVFP4); degraded answers on simple deterministic prompts; quality
+      below a reference configuration. No errors, crashes, or NaNs.
+    references: [vllm#61225, vllm#50084]
+    evidence: confirmed
+    existing_mitigation: >
+      No general guard. Individual instances are fixed or worked around
+      case by case (layout override for #61225; architecture-gated scale
+      layout for #50084). Unit tests on contiguous buffers do not catch it,
+      because only the production allocator produces the problematic
+      layouts.
+    injectable_in_vllm:
+      injectable: yes
+      method: >
+        Wrap the KV cache write so that it stores values with a layout
+        that differs from what the reader assumes, while leaving the reader
+        unchanged. Variants: (1) swap token and head strides; (2) permute
+        element order within a block; (3) for quantized KV, misplace or
+        misorder scales relative to their data. Parameters: K, V, or both;
+        fraction of layers or heads affected; data versus scales.
+  FID_02:
+    name: Block geometry mismatch and miscalculation
+    category: block_management
+    cause: >
+      On a prefix-cache hit, the position from which a request resumes
+      (computed-token count, block index, or state index) is calculated
+      incorrectly, either in the wrong block-size units or without a
+      required adjustment. The request then resumes from a point that is
+      inconsistent with its cached state.
+    fault_site: KV cache manager and prefix-cache hit/resume computation
+    preconditions: [prefix_caching]
+    blast_radius: [request, replica_or_tp_group]
+    persistence: intermittent
+    manifestation: [silent, crash]
+    severity: [correctness, availability]
+    detection_signal: >
+      Small offsets: cache-hit output diverges from a cold run starting at a
+      confidently predicted token, sometimes with abnormally short or fast
+      responses. Large offsets: out-of-bounds block-table access causing an
+      illegal memory access, which surfaces asynchronously in an unrelated
+      kernel unless CUDA_LAUNCH_BLOCKING=1 is set.
+    references: [vllm#53142, vllm#50188]
+    evidence: confirmed
+    existing_mitigation: >
+      Missing speculative-decoding adjustment fixed by #48375 (causally
+      verified in #50188). Unit mismatch in #53142 addressed by several
+      proposed fixes; the global block-size calculation that enabled it was
+      corrected upstream (#53906). No general check that a resume point is
+      consistent with cached state.
+    injectable_in_vllm:
+      injectable: yes
+      method: >
+        On a prefix-cache hit, offset the resume point (computed tokens or
+        block index) by k blocks before the request is scheduled. Small k
+        yields silently wrong state; k beyond the block table yields an
+        out-of-bounds access and crash. Parameter: k and its sign.
+  FID_03:
+    name: KV block management invariant violations
+    category: block_management
+    cause: >
+      The allocator's view of available capacity diverges from the blocks
+      actually in the free queue. Admission checks conclude that a request
+      fits, but the pool runs out mid-allocation, and the allocator fails
+      on an assertion rather than backing off.
+    fault_site: KV block pool and free-block queue
+    preconditions: [high_kv_utilization]
+    blast_radius: replica_or_tp_group
+    persistence: intermittent
+    manifestation: [crash]
+    severity: [availability]
+    detection_signal: >
+      Assertion failure in the allocator followed by EngineDeadError; all
+      in-flight requests fail. Proactively, a mismatch between the reported
+      free-block count and the free-queue length.
+    references: [vllm#42085]
+    evidence: observed
+    existing_mitigation: >
+      None confirmed. The allocator hard-asserts when the queue runs dry;
+      there is no back-pressure or preemption path for this case.
+    injectable_in_vllm:
+      injectable: yes
+      method: >
+        Withhold a set of freed blocks from the free queue (simulating blocks
+        pinned by a pending asynchronous operation) without updating the
+        free-capacity accounting, then submit requests large enough to need
+        them. Parameter: number of blocks withheld and how long.
+  FID_04:
+    name: KV token correspondence violation
+    category: kv_transfer
+    cause: >
+      KV transferred from another instance is reused on the assumption that
+      the new prompt extends the sequence the KV was computed for. When
+      tokens are removed or edited mid-sequence, the reused KV corresponds
+      to different tokens than the prompt, and the transfer path does not
+      verify the correspondence.
+    fault_site: KV connector reuse path (prefill/decode multi-turn reuse)
+    preconditions: [pd_disagg, multi_turn_kv_reuse]
+    blast_radius: request
+    persistence: permanent
+    manifestation: [silent]
+    severity: [correctness]
+    detection_signal: >
+      Mismatch between the tokens represented by the transferred KV and the
+      prompt tokens (e.g. comparing token hashes); output that diverges from
+      a full recompute of the same prompt.
+    references: [vllm#43094]
+    evidence: hypothesized
+    existing_mitigation: >
+      Delegated to the router: track conversations across turns, compare
+      prompts, and discard transferred KV when the history was edited. No
+      check inside vLLM.
+    injectable_in_vllm:
+      injectable: yes
+      method: >
+        Reuse KV computed for one token sequence in a request whose prompt
+        differs mid-sequence but has a compatible length, e.g. remove or
+        alter tokens between turns while keeping the transferred KV.
+        Parameter: position and number of edited tokens.
+  FID_05:
+    name: Prefix-cache metadata inconsistency
+    category: block_management
+    cause: >
+      The prefix cache's hash-chain bookkeeping becomes inconsistent with a
+      request's block list: a block expected to be cached has no hash, so
+      the chain cannot be extended. The possible origins (for example a hash
+      cleared by eviction while still referenced, or drift in the cached
+      block count) were not confirmed.
+    fault_site: Block pool / prefix-cache hash bookkeeping
+    preconditions: [prefix_caching]
+    blast_radius: replica_or_tp_group
+    persistence: intermittent
+    manifestation: [crash]
+    severity: [availability]
+    detection_signal: >
+      Assertion failure in the block pool's caching path followed by
+      EngineDeadError. Proactively, periodic verification that every cached
+      block preceding a request's newest cached block carries a hash.
+    references: [vllm#21992]
+    evidence: observed
+    existing_mitigation: >
+      The assertion converts the inconsistency into a fail-stop crash; the
+      issue was closed without a visible fix. Recovery today is engine
+      restart, discarding all cached KV.
+    injectable_in_vllm:
+      injectable: yes
+      method: >
+        Clear the hash of a cached block still referenced by a running
+        request, or desynchronize the request's cached-block count from its
+        block list. Parameter: which block in the chain.
+  FID_06:
+    name: KV slot reused while an in-flight transfer still accesses it
+    category: kv_transfer
+    cause: >
+      A KV slot is overwritten or reused while an asynchronous transfer is
+      still reading or writing it. Causes include missing ordering between
+      transfer streams and the compute stream (a copy reads a block before
+      compute finishes writing it, or overwrites a block compute is still
+      reading) and timeouts that release a slot without cancelling its
+      in-flight transfer.
+    fault_site: KV offload connector transfer paths (GPU-CPU streams, peer RDMA)
+    preconditions: [cpu_offload, async_scheduling, high_concurrency]
+    blast_radius: prefix_sharing_requests
+    persistence: intermittent
+    manifestation: [silent]
+    severity: [correctness]
+    detection_signal: >
+      Garbled or mixed-script output under load; divergence from a
+      no-offload reference starting at a confidently predicted token;
+      disappears when transfers are synchronized with compute. A transfer
+      reporting success after its job timed out.
+    references: [vllm#45704, vllm#47282, vllm#59569, vllm#31210, vllm#29781]
+    evidence: confirmed
+    existing_mitigation: >
+      Store path ordered against compute (#46278); symmetric load-path
+      barrier proposed (#47291); equivalent barrier in the older
+      OffloadingConnector (#31341). Peer-offload timeout before transfer
+      fixed (#59329); timeout during an in-flight transfer remains open.
+    injectable_in_vllm:
+      injectable: yes
+      method: >
+        Remove the compute-stream barrier on the store or load path, or
+        delay compute (e.g. torch.cuda._sleep) to widen the window; for the
+        timeout variant, delay a transfer past the release timeout.
+        Parameters: direction (store/load), delay length.
+  FID_07:
+    name: Complete GPU node failure (crash-stop)
+    category: hardware / availability
+    cause: >
+      GPU hardware fault (Xid errors, ECC double-bit error, fallen off the bus),
+      host crash, power or network loss, driver crash, or the worker process
+      being killed.
+    fault_site: GPU device, plus the host process holding the KV cache
+    preconditions:
+      - Node is serving at least one in-flight request, or holds prefix cache contents of value
+    blast_radius: >
+      Entire engine instance. Under TP or PP, losing one rank brings down the
+      whole instance. All in-flight requests on it fail. All KV state in GPU
+      memory is lost: active sequences and cached prefixes. Under disaggregated
+      prefill/decode, KV transfers in flight to or from the node are lost too.
+    persistence: permanent for that instance's KV state; the node is transient or permanent depending on the cause
+    manifestation:
+      - Request errors or dropped streams partway through generation
+      - Elevated TTFT after recovery (cold prefix cache, every prefix recomputed)
+      - Capacity drop and queueing on surviving replicas
+    severity:
+      - availability: high
+      - correctness: none (fail-stop; no wrong output)
+      - performance: high during recovery (recompute storm)
+    detection_signal:
+      - Worker process exit, Ray actor death
+      - NCCL errors or timeouts on surviving ranks
+      - Missed heartbeats / failed health checks
+      - Xid events in dmesg / DCGM
+    references:
+      - "Llama 3 Herd of Models (Meta, 2024): failure breakdown from 54 days of training; GPU faults were the largest category"
+      - "Hu et al., Characterization of LLM Development in the Datacenter (NSDI 2024)"
+      - "Strati et al., DéjàVu: KV-cache streaming for fast, fault-tolerant generative LLM serving (ICML 2024)"
+    evidence: >
+      Large-scale GPU fleets report hardware interruptions on the order of
+      several per day at thousand-GPU scale (training data). For serving,
+      the incidence per node is lower, but each crash destroys the node's KV state.
+    existing_mitigation: >
+      vLLM has no built-in KV recovery; the instance must be restarted.
+      Mitigation happens outside the engine: orchestrator restart (k8s/Ray),
+      load balancer retry of failed requests (full recompute), KV offload or
+      replication (LMCache tiers, DéjàVu-style streaming).
+    injectable_in_vllm:
+      injectable: true
+      method: >
+        SIGKILL the worker process or Ray actor at a chosen point (during
+        prefill, mid-decode, during a KV transfer). Kill a single TP rank to
+        exercise partial failure. Optionally drop the network on the node
+        (iptables) to emulate host or network loss.
+  FID_08:
+    name: Collective communication hang across TP ranks
+    category: communication
+    cause: >
+      Under tensor parallelism, every rank must enter and complete each
+      collective (e.g. all-reduce) together. If one rank stalls, crashes,
+      falls out of sync, or the collective implementation itself hangs, the
+      remaining ranks block inside the collective. Nothing progresses until
+      a watchdog timeout fires, which then fails the whole instance.
+    fault_site: Inter-GPU collective communication among TP ranks (NCCL and vLLM's custom all-reduce)
+    preconditions: [tensor_parallel]
+    blast_radius: replica_or_tp_group
+    persistence: intermittent
+    manifestation: [hang, crash]
+    severity: [availability, latency]
+    detection_signal: >
+      NCCL watchdog timeout errors naming the stuck collective; the last
+      completed collective lagging the last enqueued one; ranks alive but no
+      requests completing. A progress watchdog can detect the stall long
+      before the default NCCL timeout.
+    references: [vllm#4653, vllm#13535]
+    evidence: observed
+    existing_mitigation: >
+      The NCCL watchdog aborts after its timeout (10 minutes by default),
+      terminating the instance and all in-flight KV state. Disabling vLLM's
+      custom all-reduce is a reported workaround. No in-engine recovery.
+    injectable_in_vllm:
+      injectable: yes
+      method: >
+        Stall one TP rank mid-forward (SIGSTOP its worker process, or delay
+        it before an all-reduce) so the other ranks block in the collective.
+        Parameters: which rank, stall duration, phase (prefill/decode).
+  FID_09:
+    name: KV cache capacity exhaustion
+    category: block_management
+    cause: >
+      Demand for KV blocks exceeds the pool. The scheduler responds by
+      preempting requests and later recomputing them. Under sustained
+      pressure, preemption and recompute dominate, and a request whose KV
+      footprint exceeds the pool (including footprint inflated by inefficient
+      allocation) is repeatedly re-prefilled without ever completing.
+    fault_site: Scheduler admission and preemption, KV block pool
+    preconditions: [high_kv_utilization]
+    blast_radius: replica_or_tp_group
+    persistence: intermittent
+    manifestation: [slow, hang]
+    severity: [latency, availability]
+    detection_signal: >
+      Rising preemption count; high prompt throughput with near-zero
+      generation throughput; collapsing prefix-cache hit rate; the same
+      request or prefix prefilled repeatedly without completing.
+    references: [vllm#53142, vllm#53130]
+    evidence: observed
+    existing_mitigation: >
+      Preemption with recompute is the default response. Requests that can
+      never fit are not rejected up front and may re-prefill indefinitely.
+      There is no admission feedback based on actual KV footprint.
+    injectable_in_vllm:
+      injectable: yes
+      method: >
+        Reduce usable KV capacity at runtime (withhold blocks from the pool
+        while keeping accounting accurate) or lower gpu_memory_utilization,
+        then drive oversubscribed load. Parameters: fraction of capacity
+        removed, offered load.
+  FID_10:
+    name: Stale block-table reference after eviction
+    category: block_management
+    cause: >
+      When blocks are evicted (e.g. tokens leaving a sliding attention
+      window), the KV manager frees the physical blocks, but the worker-side
+      block table sent to the GPU is not updated and keeps their IDs. Once a
+      freed block is reused by another request, the stale entry references
+      foreign KV, and any read through it produces wrong output.
+    fault_site: Synchronization between the KV cache manager and the worker/GPU block table
+    preconditions: [sliding_window_attention, freed_block_reused_before_stale_entry_dropped]
+    blast_radius: request
+    persistence: intermittent
+    manifestation: [silent]
+    severity: [correctness]
+    detection_signal: >
+      Worker block-table entries that reference blocks the manager has freed
+      or reassigned; output divergence from a reference run on the affected
+      requests.
+    references: [vllm#42273]
+    evidence: confirmed
+    existing_mitigation: >
+      Correctness relies on every attention backend masking out-of-window
+      positions. A later change to free-list order (reuse freed blocks last)
+      hides the fault without removing it. A full block-table rewrite on
+      eviction is proposed (#42276).
+    injectable_in_vllm:
+      injectable: yes
+      method: >
+        After freeing a block, leave its ID in a running request's worker
+        block table and force early reuse (place freed blocks at the front
+        of the free list), so another request overwrites it. Parameters:
+        number of stale entries, position relative to the attended range,
+        reuse order.
+  FID_11:
+    name: Scheduler liveness failure under load
+    category: scheduling
+    cause: >
+      Admission and promotion of waiting requests are gated behind
+      conditions a saturated batch can keep closed. Running chunked prefills
+      can consume the entire per-step token budget so waiting requests are
+      never considered; parked requests (e.g. awaiting grammar compilation
+      or remote KV) may never be promoted; and a promoted request can hold
+      KV blocks while the request at the queue head cannot allocate, so
+      nothing runs and nothing frees blocks.
+    fault_site: Scheduler admission and waiting-queue promotion
+    preconditions: [high_concurrency, chunked_prefill]
+    blast_radius: replica_or_tp_group
+    persistence: permanent
+    manifestation: [hang]
+    severity: [availability]
+    detection_signal: >
+      Health endpoint keeps returning 200 while waiting requests accumulate,
+      completions and generated tokens stay near zero, and KV usage is low.
+      Requires a progress-based watchdog; liveness probes do not detect it.
+    references: [vllm#53130]
+    evidence: observed
+    existing_mitigation: >
+      None in the engine; recovery requires a restart. Proposed fixes
+      promote parked requests ahead of the capacity and budget gates.
+    injectable_in_vllm:
+      injectable: yes
+      method: >
+        Sustain long chunked prefills that saturate max_num_batched_tokens;
+        or park requests in a waiting state and suppress their promotion; or
+        make a promoted request hold blocks while the queue head cannot
+        allocate. Parameters: token budget, number of parked requests, load.
+  FID_12:
+    name: Progressive memory leak in the KV offload path
+    category: kv_transfer
+    cause: >
+      With KV offloading enabled, GPU memory used by the offload path is not
+      fully released after transfers, so usage grows with each request until
+      the device runs out of memory. The leaked memory lies outside what the
+      KV cache usage metric reports. The specific cause was not established;
+      a block-size mismatch between the model's KV blocks and the offload
+      pipeline is suspected.
+    fault_site: KV offload connector (GPU-side staging and block handling)
+    preconditions: [cpu_offload, prefix_caching]
+    blast_radius: replica_or_tp_group
+    persistence: permanent
+    manifestation: [slow, crash]
+    severity: [availability]
+    detection_signal: >
+      GPU memory usage growing monotonically under steady load while KV
+      cache usage stays within bounds; eventual CUDA out-of-memory error.
+      Requires trend-based monitoring, since any single reading looks
+      normal until shortly before the crash.
+    references: [vllm#44181]
+    evidence: observed
+    existing_mitigation: >
+      None in the engine. Disabling KV offloading removes the leak.
+      Periodic restarts avoid the crash.
+    injectable_in_vllm:
+      injectable: yes
+      method: >
+        In the offload path, retain a GPU buffer or block reference per
+        transfer without releasing it, so memory accumulates with each
+        offloaded request. Parameters: bytes leaked per transfer, leak
+        frequency.
