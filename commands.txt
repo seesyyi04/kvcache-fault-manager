@@ -1,0 +1,10 @@
+Start python venv:
+	source /xtra/yi000101/.venv/bin/activate
+
+Set bytecode cache setting:
+	echo "[$PYTHONPYCACHEPREFIX]"
+	export PYTHONPYCACHEPREFIX=/tmp/$USER-pycache
+	echo 'export PYTHONPYCACHEPREFIX=/tmp/$USER-pycache' >> /xtra/yi000101/.venv/bin/activate
+
+Stop pytest writing its own cache to the network drive:
+	pytest tests/test_premature_free.py -q -s -p no:cacheprovider
