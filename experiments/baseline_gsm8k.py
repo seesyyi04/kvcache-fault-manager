@@ -100,13 +100,12 @@ def _num_cached_tokens(result):
 			return obj.num_cached_tokens
 	return None
 
-def _model_revision(llm):
-	try:
-		cfg = getattr(getattr(llm, "llm_engine", None), "model_config", None) \
-			  or getattr(llm, "model_config", None)
-		return getattr(cfg, "revision", None) if cfg is not None else None
-	except Exception:
-		return None
+def _model_revision(model_name):
+    try:
+        from huggingface_hub import HfApi
+        return HfApi().model_info(model_name).sha
+    except Exception as e:
+        return f"unavailable: {e}"
 
 def _hardware():
 	try:
@@ -135,7 +134,7 @@ def _engine_metrics(llm):
 def main():
 	args = parse_args()
 
-	out_path = os.path.join(args.out, "output.jsonl")
+	out_path = os.path.join(args.out, "outputs.jsonl")
 	if os.path.exists(out_path):
 		sys.exit(f"Refusing to overwrite run in {args.out}")
 	os.makedirs(args.out, exist_ok=True)
@@ -235,7 +234,7 @@ def main():
 		"args": vars(args),
 		"engine_kwargs": engine_kwargs,
 		"git": git_info(),
-		"model_revision": _model_revision(llm),
+		"model_revision": _model_revision(args.model),
 		"versions": {
 			"vllm": vllm.__version__,
 			"torch": torch.__version__,
