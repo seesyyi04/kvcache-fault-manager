@@ -37,3 +37,6 @@ env/
 *.swp
 *~
 .DS_Store
+
+# --- other ---
+commands.txt
