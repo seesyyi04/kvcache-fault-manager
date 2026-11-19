@@ -1,0 +1,39 @@
+# --- experiment outputs (large; kept on the Lambda filesystem + backups) ---
+results/
+runs/
+*.log
+gpu.csv
+
+# --- model / dataset caches ---
+hf_cache/
+.cache/
+
+# --- secrets (never commit tokens) ---
+.env
+*.env
+hf_token*
+secrets*
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- virtual environments ---
+.venv/
+venv/
+env/
+
+# --- editors / OS ---
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
