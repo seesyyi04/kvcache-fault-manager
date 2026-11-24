@@ -2,26 +2,10 @@
 """
 GSM8K client runner for vLLM v0.34.0 server (per-request metrics).
 
-Prerequisite — a live vLLM server, e.g.:
-  python inject_launcher.py --model meta-llama/Llama-3.1-8B-Instruct \
-      --tensor-parallel-size 8 --enable-per-request-metrics --port 8000
+Prerequisite — a live vLLM server started from launcherFID01.
 
-This script does NOT start the engine. It sends one chat request per
-GSM8K test question and writes per-request metrics + provenance.
-
-Outputs (into --out):
-  outputs.jsonl  one line per question (text, logprobs, gold/pred,
-                 ttft_ms, queue_ms, generation_ms, itl_ms, tokens/s)
-  meta.json      run metadata (args, fault condition, versions, hardware,
-                 aggregate results, percentiles)
-  server_metrics.txt  raw Prometheus /metrics dump (best-effort)
-
-Fault condition is read from environment (set by the launcher / shell):
-  FAULT_MODE   {clean,over_aligned,under_aligned,misaligned}
-  FAULT_P      probability that a cache-hit request was corrupted
-  FAULT_SEED   RNG seed used by the server-side gate
-  These are recorded per-run; per-request attribution requires the
-  launcher to also log which request IDs it corrupted (see note below).
+Reads FAULT_MODE, FAULT_P, FAULT_SEED from environment for provenance.
+Writes outputs.jsonl, meta.json, server_metrics.txt into --out.
 """
 import argparse
 import json
@@ -44,59 +28,44 @@ SYSTEM_PROMPT = (
 ANSWER_RE = re.compile(r"####\s*(-?[\d,]*\.?\d+)")
 NUMBER_RE = re.compile(r"-?[\d,]*\.?\d+")
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--model", default=DEFAULT_MODEL)
-    p.add_argument("--base-url", default=DEFAULT_BASE_URL,
-                   help="vLLM OpenAI-compatible server URL")
-    p.add_argument("--out", required=True, help="output directory for this run")
+    p.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    p.add_argument("--out", required=True)
     p.add_argument("--max-tokens", type=int, default=512)
     p.add_argument("--num-shots", type=int, default=8)
-    p.add_argument("--limit", type=int, default=None,
-                   help="only run the first N test questions")
-    p.add_argument("--seed", type=int, default=0,
-                   help="sampling seed (forwarded to server; 0 + temp 0 = greedy)")
-    p.add_argument("--timeout", type=float, default=300.0,
-                   help="per-request HTTP timeout in seconds")
-    p.add_argument("--resume", action="store_true",
-                   help="append to existing outputs.jsonl, skipping done indices")
-    # The following are engine/server settings. They are NOT consumed here —
-    # they are recorded in meta.json for provenance so you know which server
-    # configuration produced each run. They must match the server launch.
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--timeout", type=float, default=300.0)
+    p.add_argument("--resume", action="store_true")
+    # Recorded for provenance only:
     p.add_argument("--prefix-caching", choices=["on", "off"], default="on")
     p.add_argument("--tp", type=int, default=1, choices=[1, 2, 4, 8])
     p.add_argument("--max-model-len", type=int, default=4096)
     p.add_argument("--max-num-seqs", type=int, default=128)
     return p.parse_args()
 
+def _run(cmd):
+    try:
+        r = subprocess.run(
+            cmd, capture_output=True, text=True,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 def git_info():
-    def run(cmd):
-        try:
-            return subprocess.run(
-                cmd, capture_output=True, text=True,
-                cwd=os.path.dirname(os.path.abspath(__file__)),
-            ).stdout.strip()
-        except Exception:
-            return None
     return {
-        "commit": run(["git", "rev-parse", "HEAD"]),
-        "dirty": bool(run(["git", "status", "--porcelain"])),
+        "commit": _run(["git", "rev-parse", "HEAD"]),
+        "dirty": bool(_run(["git", "status", "--porcelain"])),
     }
 
-
 def parse_answer(text):
-    """Extract the final numeric answer; return canonical str or None."""
     if not text:
         return None
     m = ANSWER_RE.search(text)
@@ -115,9 +84,7 @@ def parse_answer(text):
     except ValueError:
         return None
 
-
 def build_conversations(train, test, num_shots):
-    """Shared few-shot prefix (system + K pairs) followed by each test question."""
     shots = train.select(range(min(num_shots, len(train))))
     prefix = [{"role": "system", "content": SYSTEM_PROMPT}]
     for shot in shots:
@@ -125,14 +92,12 @@ def build_conversations(train, test, num_shots):
         prefix.append({"role": "assistant", "content": shot["answer"]})
     return [prefix + [{"role": "user", "content": ex["question"]}] for ex in test]
 
-
 def _model_revision(model_name):
     try:
         from huggingface_hub import HfApi
         return HfApi().model_info(model_name).sha
     except Exception as e:
         return f"unavailable: {e}"
-
 
 def _hardware():
     try:
@@ -153,9 +118,7 @@ def _hardware():
         pass
     return {"gpu_names": gpus, "nvidia_driver": driver}
 
-
 def _server_version(base_url):
-    """Probe /version (vLLM exposes it)."""
     try:
         url = base_url.replace("/v1", "/version")
         with urllib.request.urlopen(url, timeout=5) as r:
@@ -163,9 +126,7 @@ def _server_version(base_url):
     except Exception as e:
         return {"error": str(e)}
 
-
 def _server_metrics_text(base_url):
-    """Fetch raw Prometheus /metrics."""
     try:
         url = base_url.replace("/v1", "/metrics")
         with urllib.request.urlopen(url, timeout=10) as r:
@@ -173,47 +134,35 @@ def _server_metrics_text(base_url):
     except Exception as e:
         return f"# unavailable: {e}\n"
 
-
-def _pct(xs, p):
+def _percentile(xs, p):
     xs = sorted(x for x in xs if x is not None)
     if not xs:
         return None
     k = max(0, min(len(xs) - 1, int(round((p / 100.0) * (len(xs) - 1)))))
     return xs[k]
 
+def _get_field(m, name):
+    if isinstance(m, dict):
+        return m.get(name)
+    return getattr(m, name, None)
 
 def _extract_metrics(response):
-    """
-    vLLM attaches a per-request metrics object to the response.
-    Shape/namespace varies slightly across versions → probe defensively.
-    """
     m = getattr(response, "metrics", None)
     if m is None:
-        # Some builds nest under extra fields
         extra = getattr(response, "model_extra", None) or {}
         m = extra.get("metrics")
     if m is None:
-        return {
-            "ttft_ms": None, "queue_ms": None, "generation_ms": None,
-            "itl_ms": None, "tokens_per_second": None,
-        }
-
-    def g(name):
-        if isinstance(m, dict):
-            return m.get(name)
-        return getattr(m, name, None)
-
+        return {"ttft_ms": None, "queue_ms": None, "generation_ms": None,
+                "itl_ms": None, "tokens_per_second": None}
     return {
-        "ttft_ms":           g("time_to_first_token_ms"),
-        "queue_ms":          g("queue_time_ms"),
-        "generation_ms":     g("generation_time_ms"),
-        "itl_ms":            g("mean_itl_ms"),
-        "tokens_per_second": g("tokens_per_second"),
+        "ttft_ms":           _get_field(m, "time_to_first_token_ms"),
+        "queue_ms":          _get_field(m, "queue_time_ms"),
+        "generation_ms":     _get_field(m, "generation_time_ms"),
+        "itl_ms":            _get_field(m, "mean_itl_ms"),
+        "tokens_per_second": _get_field(m, "tokens_per_second"),
     }
 
-
 def _extract_logprobs(choice):
-    """Chat API: choice.logprobs.content is a list of token-info objects."""
     if not (getattr(choice, "logprobs", None) and choice.logprobs.content):
         return [], []
     tokens, lps = [], []
@@ -222,42 +171,96 @@ def _extract_logprobs(choice):
         lps.append(getattr(t, "logprob", None))
     return tokens, lps
 
+def _load_done_idx(out_path, resume):
+    done_idx = set()
+    if resume and os.path.exists(out_path):
+        with open(out_path) as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if "error" not in row:
+                    done_idx.add(row["idx"])
+        print(f"[resume] {len(done_idx)} completed rows already in {out_path}")
+        return done_idx, "a"
+    if os.path.exists(out_path):
+        sys.exit(f"Refusing to overwrite {os.path.dirname(out_path)}; use --resume")
+    return done_idx, "w"
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def _send_request(client, model, conv, max_tokens, seed):
+    return client.chat.completions.create(
+        model=model,
+        messages=conv,
+        max_tokens=max_tokens,
+        temperature=0.0,
+        logprobs=True,
+        top_logprobs=1,
+        extra_body={"include_metrics": True, "seed": seed},
+    )
+
+def _build_success_row(idx, response, example, fault_mode):
+    choice = response.choices[0]
+    text = choice.message.content or ""
+    tokens, lps = _extract_logprobs(choice)
+
+    gold_label = parse_answer(example["answer"])
+    prediction = parse_answer(text)
+    correct = (gold_label is not None
+               and prediction is not None
+               and gold_label == prediction)
+    is_length_stop = (choice.finish_reason == "length")
+
+    usage = getattr(response, "usage", None)
+    p_tokens = getattr(usage, "prompt_tokens", None) if usage else None
+    c_tokens = getattr(usage, "completion_tokens", None) if usage else None
+    m = _extract_metrics(response)
+
+    row = {
+        "idx": idx,
+        "request_id": getattr(response, "id", None),
+        "model": getattr(response, "model", None),
+        "created": getattr(response, "created", None),
+        "gold_label": gold_label,
+        "prediction": prediction,
+        "correct": correct,
+        "finish_reason": choice.finish_reason,
+        "prompt_tokens": p_tokens,
+        "completion_tokens": c_tokens,
+        "text": text,
+        "tokens": tokens,
+        "logprobs": lps,
+        "ttft_ms": m["ttft_ms"],
+        "queue_ms": m["queue_ms"],
+        "generation_ms": m["generation_ms"],
+        "itl_ms": m["itl_ms"],
+        "tokens_per_second": m["tokens_per_second"],
+        "fault_mode": fault_mode,
+    }
+    return row, correct, is_length_stop, p_tokens, c_tokens, m
+
+def _build_error_row(idx, error, example):
+    return {
+        "idx": idx,
+        "error": str(error),
+        "gold_label": parse_answer(example["answer"]),
+    }
+
 def main():
     args = parse_args()
 
     out_path = os.path.join(args.out, "outputs.jsonl")
     os.makedirs(args.out, exist_ok=True)
 
-    done_idx = set()
-    if args.resume and os.path.exists(out_path):
-        with open(out_path) as f:
-            for line in f:
-                try:
-                    done_idx.add(json.loads(line)["idx"])
-                except Exception:
-                    pass
-        write_mode = "a"
-        print(f"[resume] {len(done_idx)} rows already present in {out_path}")
-    else:
-        if os.path.exists(out_path):
-            sys.exit(f"Refusing to overwrite {args.out}; use --resume to continue")
-        write_mode = "w"
+    done_idx, write_mode = _load_done_idx(out_path, args.resume)
 
-    # Imports after arg-parsing so --help works without heavy deps
     from datasets import load_dataset
     from openai import OpenAI
 
     client = OpenAI(
-        base_url=args.base_url,
-        api_key="EMPTY",
-        timeout=args.timeout,
+        base_url=args.base_url, api_key="EMPTY", timeout=args.timeout,
     )
 
-    # Fail fast if server unreachable
     try:
         client.models.list()
     except Exception as e:
@@ -268,18 +271,25 @@ def main():
     if args.limit is not None:
         test = test.select(range(min(args.limit, len(test))))
 
+    remaining = len(test) - len(done_idx)
+    if remaining <= 0:
+        print(f"[{args.out}] nothing to do — all {len(test)} rows complete")
+        return
+
     conversations = build_conversations(train, test, args.num_shots)
 
-    # Fault condition — set by launcher/shell; recorded for provenance
     fault_mode = os.environ.get("FAULT_MODE", "clean")
     fault_p = os.environ.get("FAULT_P")
     fault_seed = os.environ.get("FAULT_SEED")
     print(f"[fault] mode={fault_mode} p={fault_p} seed={fault_seed}")
 
-    n_correct = n_length_stops = 0
-    total_prompt_tokens = total_completion_tokens = 0
-    ttfts, queues, gens, itls = [], [], [], []
+    n_correct = 0
+    n_ok = 0
     n_errors = 0
+    n_length_stops = 0
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    ttfts, queues, gens, itls = [], [], [], []
 
     t0 = time.time()
     with open(out_path, write_mode) as f:
@@ -288,109 +298,63 @@ def main():
                 continue
 
             try:
-                response = client.chat.completions.create(
-                    model=args.model,
-                    messages=conv,
-                    max_tokens=args.max_tokens,
-                    temperature=0.0,
-                    logprobs=True,
-                    top_logprobs=1,
-                    extra_body={
-                        "include_metrics": True,
-                        "seed": args.seed,
-                    },
+                response = _send_request(
+                    client, args.model, conv, args.max_tokens, args.seed,
                 )
             except Exception as e:
                 n_errors += 1
                 sys.stderr.write(f"[{i}] request failed: {e}\n")
-                # Record the failure so the row is not silently missing
-                f.write(json.dumps({
-                    "idx": i,
-                    "error": str(e),
-                    "gold_label": parse_answer(example["answer"]),
-                }) + "\n")
+                f.write(json.dumps(_build_error_row(i, e, example)) + "\n")
                 f.flush()
                 continue
 
-            choice = response.choices[0]
-            text = choice.message.content or ""
+            (row, correct, is_length_stop,
+             p_tokens, c_tokens, m) = _build_success_row(
+                i, response, example, fault_mode,
+            )
 
-            tokens, lps = _extract_logprobs(choice)
-
-            gold_label = parse_answer(example["answer"])
-            prediction = parse_answer(text)
-            correct = (gold_label is not None
-                       and prediction is not None
-                       and gold_label == prediction)
             if correct:
                 n_correct += 1
-            if choice.finish_reason == "length":
+            if is_length_stop:
                 n_length_stops += 1
+            n_ok += 1
 
-            usage = getattr(response, "usage", None)
-            p_tokens = getattr(usage, "prompt_tokens", None) if usage else None
-            c_tokens = getattr(usage, "completion_tokens", None) if usage else None
             if p_tokens:
                 total_prompt_tokens += p_tokens
             if c_tokens:
                 total_completion_tokens += c_tokens
 
-            m = _extract_metrics(response)
             if m["ttft_ms"] is not None:       ttfts.append(m["ttft_ms"])
             if m["queue_ms"] is not None:      queues.append(m["queue_ms"])
             if m["generation_ms"] is not None: gens.append(m["generation_ms"])
             if m["itl_ms"] is not None:        itls.append(m["itl_ms"])
 
-            f.write(json.dumps({
-                "idx": i,
-                "request_id": getattr(response, "id", None),
-                "model": getattr(response, "model", None),
-                "created": getattr(response, "created", None),
-                "gold_label": gold_label,
-                "prediction": prediction,
-                "correct": correct,
-                "finish_reason": choice.finish_reason,
-                "prompt_tokens": p_tokens,
-                "completion_tokens": c_tokens,
-                "text": text,
-                "tokens": tokens,
-                "logprobs": lps,
-                "ttft_ms": m["ttft_ms"],
-                "queue_ms": m["queue_ms"],
-                "generation_ms": m["generation_ms"],
-                "itl_ms": m["itl_ms"],
-                "tokens_per_second": m["tokens_per_second"],
-                "fault_mode": fault_mode,
-            }) + "\n")
+            f.write(json.dumps(row) + "\n")
             f.flush()
 
-            if (i + 1) % 50 == 0:
+            processed = n_ok + n_errors
+            if processed % 50 == 0:
                 elapsed = time.time() - t0
-                print(f"[{i+1}/{len(test)}] elapsed={elapsed:.0f}s "
-                      f"acc={n_correct/max(1,i+1-len(done_idx)):.4f} "
-                      f"errors={n_errors}")
+                acc_live = (n_correct / n_ok) if n_ok else 0.0
+                print(f"[{processed}/{remaining}] elapsed={elapsed:.0f}s "
+                      f"acc={acc_live:.4f} ok={n_ok} errors={n_errors}")
 
     wall_s = time.time() - t0
 
-    # Snapshot the server /metrics while still alive
     sm_path = os.path.join(args.out, "server_metrics.txt")
     with open(sm_path, "w") as f:
         f.write(_server_metrics_text(args.base_url))
 
-    # Aggregate results (over the rows actually attempted in this invocation)
-    n_attempted = max(1, len(test) - len(done_idx))
-    accuracy = n_correct / n_attempted
+    n_attempted = n_ok + n_errors
+    accuracy_ok_only = (n_correct / n_ok) if n_ok else 0.0
+    accuracy_with_errors = (n_correct / n_attempted) if n_attempted else 0.0
 
     from openai import __version__ as openai_ver
 
     meta = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "args": vars(args),
-        "fault_condition": {
-            "mode": fault_mode,
-            "p": fault_p,
-            "seed": fault_seed,
-        },
+        "fault_condition": {"mode": fault_mode, "p": fault_p, "seed": fault_seed},
         "git": git_info(),
         "model_revision": _model_revision(args.model),
         "versions": {
@@ -401,23 +365,25 @@ def main():
         "server_version": _server_version(args.base_url),
         "results": {
             "n_attempted": n_attempted,
-            "n_done_this_run": n_attempted,
+            "n_ok": n_ok,
             "n_errors": n_errors,
-            "accuracy": accuracy,
+            "n_correct": n_correct,
+            "accuracy_ok_only": accuracy_ok_only,
+            "accuracy_with_errors": accuracy_with_errors,
             "length_stops": n_length_stops,
             "prompt_tokens": total_prompt_tokens,
             "completion_tokens": total_completion_tokens,
             "wall_s": wall_s,
             "tokens_per_sec_client": (total_completion_tokens / wall_s) if wall_s > 0 else None,
-            "ttft_ms_p50": _pct(ttfts, 50),
-            "ttft_ms_p90": _pct(ttfts, 90),
-            "ttft_ms_p99": _pct(ttfts, 99),
-            "queue_ms_p50": _pct(queues, 50),
-            "queue_ms_p90": _pct(queues, 90),
-            "generation_ms_p50": _pct(gens, 50),
-            "generation_ms_p90": _pct(gens, 90),
-            "itl_ms_p50": _pct(itls, 50),
-            "itl_ms_p90": _pct(itls, 90),
+            "ttft_ms_p50": _percentile(ttfts, 50),
+            "ttft_ms_p90": _percentile(ttfts, 90),
+            "ttft_ms_p99": _percentile(ttfts, 99),
+            "queue_ms_p50": _percentile(queues, 50),
+            "queue_ms_p90": _percentile(queues, 90),
+            "generation_ms_p50": _percentile(gens, 50),
+            "generation_ms_p90": _percentile(gens, 90),
+            "itl_ms_p50": _percentile(itls, 50),
+            "itl_ms_p90": _percentile(itls, 90),
         },
     }
     with open(os.path.join(args.out, "meta.json"), "w") as f:
@@ -425,12 +391,14 @@ def main():
 
     r = meta["results"]
     print(
-        f"[{args.out}] fault={fault_mode} n={n_attempted} acc={accuracy:.4f} "
-        f"len_stops={n_length_stops} errors={n_errors} wall={wall_s:.1f}s "
+        f"[{args.out}] fault={fault_mode} "
+        f"attempted={n_attempted} ok={n_ok} errors={n_errors} "
+        f"acc_ok={r['accuracy_ok_only']:.4f} "
+        f"acc_all={r['accuracy_with_errors']:.4f} "
+        f"len_stops={n_length_stops} wall={wall_s:.1f}s "
         f"ttft_p50={r['ttft_ms_p50']}ms ttft_p90={r['ttft_ms_p90']}ms "
         f"itl_p50={r['itl_ms_p50']}ms"
     )
-
 
 if __name__ == "__main__":
     main()

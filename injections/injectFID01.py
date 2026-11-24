@@ -1,3 +1,4 @@
+# injections/injectFID01.py
 from enum import Enum, auto
 
 class Fid01Mode(Enum):
@@ -33,9 +34,9 @@ def under_aligned(resume_token_index, block_size, k_blocks=1):
     check_aligned(resume_token_index, block_size)
     if k_blocks < 1:
         raise ValueError(f"k_blocks must be >= 1")
-    return resume_token_index - k_blocks * block_size
+    return max(0, resume_token_index - k_blocks * block_size)
 
-def misaligned(resume_token_index, block_size, offset):
+def misaligned(resume_token_index, block_size, offset=None):
     """
     Resume at a token index inside the correct block (not on a boundary).
     Cache effect: downstream code slices input_ids at this token but still
@@ -48,11 +49,11 @@ def misaligned(resume_token_index, block_size, offset):
     check_aligned(resume_token_index, block_size)
     if offset is None:
         offset = block_size // 2
-    if not (0 < abs(block_size) < block_size):
+    if not (0 < abs(offset) < block_size):
         raise ValueError(f"Offset must satisfy 0 < |offset| < {block_size}; offset got {offset}")
     return resume_token_index + offset
 
-def inject_fid01(resume_token_index, block_size, mode, magnitude):
+def inject_fid01(resume_token_index, block_size, mode, magnitude=None):
     """
     Dispath fault injection.
     magnitude:
@@ -67,4 +68,4 @@ def inject_fid01(resume_token_index, block_size, mode, magnitude):
                             magnitude if magnitude is not None else 1)
     if mode is Fid01Mode.MISALIGNED:
         return misaligned(resume_token_index, block_size, offset=magnitude)
-    raise ValueError("InjectFID01: Unknown fault mode: {mode}")
+    raise ValueError(f"InjectFID01: Unknown fault mode: {mode}")
