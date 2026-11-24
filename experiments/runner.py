@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-GSM8K client runner for vLLM v0.34.0 server (per-request metrics).
+GSM8K client runner for vLLM v0.34.0 OpenAI-compatible server.
 
-Prerequisite — a live vLLM server started from launcherFID01.
+Prerequisite — a live vLLM server started with `vllm serve`.
+Suggested server flags:
+    --enable-prompt-tokens-details : per-request cached-token counts
+    --enable-request-id-headers : lets each request carry a stable ID
 
-Reads FAULT_MODE, FAULT_P, FAULT_SEED from environment for provenance.
-Writes outputs.jsonl, meta.json, server_metrics.txt into --out.
+Sends requests concurrently (--concurrency). Reads FAULT_MODE, FAULT_P,
+FAULT_SEED from the environment for provenance. Writes outputs.jsonl,
+meta.json, server_metrics.txt.
 """
 import argparse
 import json
@@ -16,6 +20,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
@@ -27,6 +32,7 @@ SYSTEM_PROMPT = (
 )
 ANSWER_RE = re.compile(r"####\s*(-?[\d,]*\.?\d+)")
 NUMBER_RE = re.compile(r"-?[\d,]*\.?\d+")
+TOKEN_ID_RE = re.compile(r"^token_id:(\d+)$")
 
 def parse_args():
     p = argparse.ArgumentParser(
@@ -41,6 +47,8 @@ def parse_args():
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--timeout", type=float, default=300.0)
+    p.add_argument("__concurrency", type=int, default=64,
+                   help="Requests in flight at once")
     p.add_argument("--resume", action="store_true")
     # Recorded for provenance only:
     p.add_argument("--prefix-caching", choices=["on", "off"], default="on")
@@ -100,23 +108,18 @@ def _model_revision(model_name):
         return f"unavailable: {e}"
 
 def _hardware():
-    try:
-        import torch
-        gpus = [torch.cuda.get_device_name(i)
-                for i in range(torch.cuda.device_count())]
-    except Exception:
-        gpus = []
-    driver = None
+    gpus=[]
     try:
         r = subprocess.run(
-            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=5,
+            ["nvidia-smi", "--query-gpu=driver_version,memory.total",
+             "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
         )
         if r.returncode == 0 and r.stdout.strip():
             driver = r.stdout.strip().splitlines()[0]
     except Exception:
         pass
-    return {"gpu_names": gpus, "nvidia_driver": driver}
+    return {"gpu_names": gpus, "hostname": platform.node}
 
 def _server_version(base_url):
     try:
@@ -162,14 +165,22 @@ def _extract_metrics(response):
         "tokens_per_second": _get_field(m, "tokens_per_second"),
     }
 
-def _extract_logprobs(choice):
-    if not (getattr(choice, "logprobs", None) and choice.logprobs.content):
+def _extract_tokens(choice):
+    lp = getattr(choice, "logprobs", None)
+    content = getattr(lp, "content", None) if lp is not None else None
+    if not content:
         return [], []
-    tokens, lps = [], []
-    for t in choice.logprobs.content:
-        tokens.append(getattr(t, "token", None))
-        lps.append(getattr(t, "logprob", None))
-    return tokens, lps
+    token_ids, logprobs = [], []
+    for t in content:
+        tok = getattr(t, "token", None) or ""
+        m = TOKEN_ID_RE.match(tok)
+        token_ids.append(int(m.group(1)) if m else None)
+        logprobs.append(getattr(t, "logprob", None))
+    return token_ids, logprobs
+
+def _cached_tokens(usage):
+    details = getattr(usage, "prompt_token_details", None) if usage else None
+    return getattr(details, "cached_tokens", None) if details else None
 
 def _load_done_idx(out_path, resume):
     done_idx = set()
@@ -188,7 +199,7 @@ def _load_done_idx(out_path, resume):
         sys.exit(f"Refusing to overwrite {os.path.dirname(out_path)}; use --resume")
     return done_idx, "w"
 
-def _send_request(client, model, conv, max_tokens, seed):
+def _send_request(client, model, conv, max_tokens, seed, idx):
     return client.chat.completions.create(
         model=model,
         messages=conv,
@@ -196,28 +207,31 @@ def _send_request(client, model, conv, max_tokens, seed):
         temperature=0.0,
         logprobs=True,
         top_logprobs=1,
-        extra_body={"include_metrics": True, "seed": seed},
+        extra_headers={"X-Request-Id": f"q{idx}"},
+        extra_body={
+            "include_metrics": True,
+            "seed": seed,
+            "return_tokens_as_token_ids": True,
+        },
     )
 
 def _build_success_row(idx, response, example, fault_mode):
     choice = response.choices[0]
     text = choice.message.content or ""
-    tokens, lps = _extract_logprobs(choice)
+    tokens, logprobs = _extract_logprobs(choice)
 
     gold_label = parse_answer(example["answer"])
     prediction = parse_answer(text)
     correct = (gold_label is not None
                and prediction is not None
                and gold_label == prediction)
-    is_length_stop = (choice.finish_reason == "length")
 
     usage = getattr(response, "usage", None)
-    p_tokens = getattr(usage, "prompt_tokens", None) if usage else None
-    c_tokens = getattr(usage, "completion_tokens", None) if usage else None
     m = _extract_metrics(response)
 
-    row = {
+    return {
         "idx": idx,
+        "request_key": f"q{idx}",
         "request_id": getattr(response, "id", None),
         "model": getattr(response, "model", None),
         "created": getattr(response, "created", None),
@@ -225,23 +239,20 @@ def _build_success_row(idx, response, example, fault_mode):
         "prediction": prediction,
         "correct": correct,
         "finish_reason": choice.finish_reason,
-        "prompt_tokens": p_tokens,
-        "completion_tokens": c_tokens,
+        "num_prompt_tokens": getattr(usage, "prompt_tokens", None) if usage else None,
+        "num_cached_tokens": _cached_tokens(usage),
+        "num_output_tokens": getattr(usage, "completion_tokens", None) if usage else None,
         "text": text,
-        "tokens": tokens,
-        "logprobs": lps,
-        "ttft_ms": m["ttft_ms"],
-        "queue_ms": m["queue_ms"],
-        "generation_ms": m["generation_ms"],
-        "itl_ms": m["itl_ms"],
-        "tokens_per_second": m["tokens_per_second"],
+        "token_ids": token_ids,
+        "logprobs": logprobs,
+        **m,
         "fault_mode": fault_mode,
     }
-    return row, correct, is_length_stop, p_tokens, c_tokens, m
 
 def _build_error_row(idx, error, example):
     return {
         "idx": idx,
+        "request_key": f"q{idx}",
         "error": str(error),
         "gold_label": parse_answer(example["answer"]),
     }
@@ -257,10 +268,7 @@ def main():
     from datasets import load_dataset
     from openai import OpenAI
 
-    client = OpenAI(
-        base_url=args.base_url, api_key="EMPTY", timeout=args.timeout,
-    )
-
+    client = OpenAI(base_url=args.base_url, api_key="EMPTY", timeout=args.timeout,)
     try:
         client.models.list()
     except Exception as e:
@@ -270,37 +278,35 @@ def main():
     train, test = dataset["train"], dataset["test"]
     if args.limit is not None:
         test = test.select(range(min(args.limit, len(test))))
-
-    remaining = len(test) - len(done_idx)
-    if remaining <= 0:
-        print(f"[{args.out}] nothing to do — all {len(test)} rows complete")
-        return
-
     conversations = build_conversations(train, test, args.num_shots)
+
+    todo = [(i, ex, conv) for i, (ex, conv) in enumerate(zip(test, conversations))
+            if i not in done_idx]
+    if not todo:
+        print(f"[{args.out}] nothing to do: all {len(test)} rows complete")
 
     fault_mode = os.environ.get("FAULT_MODE", "clean")
     fault_p = os.environ.get("FAULT_P")
     fault_seed = os.environ.get("FAULT_SEED")
-    print(f"[fault] mode={fault_mode} p={fault_p} seed={fault_seed}")
+    print(f"[fault] mode={fault_mode} p={fault_p} seed={fault_seed} "
+          f"requests={len(todo)} concurrency={args.concurrency}")
 
-    n_correct = 0
-    n_ok = 0
-    n_errors = 0
-    n_length_stops = 0
-    total_prompt_tokens = 0
-    total_completion_tokens = 0
+    n_correct = n_ok = n_errors = n_length_stops = 0
+    total_prompt_tokens = total_completion_tokens = 0
     ttfts, queues, gens, itls = [], [], [], []
 
     t0 = time.time()
-    with open(out_path, write_mode) as f:
-        for i, (example, conv) in enumerate(zip(test, conversations)):
-            if i in done_idx:
-                continue
-
+    # Requests run in worker threads; results are written here, in the main thread.
+    with open(out_path, write_mode) as f, ThreadPoolExecutor(args.concurrency) as pool:
+        futures = {
+            pool.submit(_send_request, client, args.model, conv, args.max_tokens,
+                        args.seed, i): (i, ex)
+            for i, ex, conv in todo
+        }
+        for fut in as_completed(futures):
+            i, example = futures[fut]
             try:
-                response = _send_request(
-                    client, args.model, conv, args.max_tokens, args.seed,
-                )
+                response = fut.result()
             except Exception as e:
                 n_errors += 1
                 sys.stderr.write(f"[{i}] request failed: {e}\n")
@@ -308,36 +314,26 @@ def main():
                 f.flush()
                 continue
 
-            (row, correct, is_length_stop,
-             p_tokens, c_tokens, m) = _build_success_row(
-                i, response, example, fault_mode,
-            )
-
-            if correct:
-                n_correct += 1
-            if is_length_stop:
-                n_length_stops += 1
+            row = _build_success_row(i, response, example, fault_mode)
             n_ok += 1
-
-            if p_tokens:
-                total_prompt_tokens += p_tokens
-            if c_tokens:
-                total_completion_tokens += c_tokens
-
-            if m["ttft_ms"] is not None:       ttfts.append(m["ttft_ms"])
-            if m["queue_ms"] is not None:      queues.append(m["queue_ms"])
-            if m["generation_ms"] is not None: gens.append(m["generation_ms"])
-            if m["itl_ms"] is not None:        itls.append(m["itl_ms"])
+            n_correct += row["correct"]
+            n_length_stops += row["finish_reason"] == "length"
+            total_prompt_tokens += row["num_prompt_tokens"] or 0
+            total_output_tokens += row["num_output_tokens"] or 0
+            if row["ttft_ms"] is not None: ttfts.append(row["ttft_ms"])
+            if row["queue_ms"] is not None: queues.append(row["queue_ms"])
+            if row["generation_ms"] is not None: gens.append(row["generation_ms"])
+            if row["itl_ms"] is not None: itls.append(row["itl_ms"])
 
             f.write(json.dumps(row) + "\n")
             f.flush()
 
             processed = n_ok + n_errors
-            if processed % 50 == 0:
+            if processed % 100 == 0:
                 elapsed = time.time() - t0
                 acc_live = (n_correct / n_ok) if n_ok else 0.0
                 print(f"[{processed}/{remaining}] elapsed={elapsed:.0f}s "
-                      f"acc={acc_live:.4f} ok={n_ok} errors={n_errors}")
+                      f"acc={acc_live:.4f} ok={n_ok} errors={n_errors}", flush=True)
 
     wall_s = time.time() - t0
 
@@ -345,16 +341,13 @@ def main():
     with open(sm_path, "w") as f:
         f.write(_server_metrics_text(args.base_url))
 
-    n_attempted = n_ok + n_errors
-    accuracy_ok_only = (n_correct / n_ok) if n_ok else 0.0
-    accuracy_with_errors = (n_correct / n_attempted) if n_attempted else 0.0
-
     from openai import __version__ as openai_ver
-
+    n_attempted = n_ok + n_errors
     meta = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "args": vars(args),
-        "fault_condition": {"mode": fault_mode, "p": fault_p, "seed": fault_seed},
+        "fault_condition": {"mode": fault_mode, "p": fault_p, "seed": fault_seed,
+                            "magnitude:" os.environ.get("FAULT_MAGNITUDE")},
         "git": git_info(),
         "model_revision": _model_revision(args.model),
         "versions": {
@@ -368,13 +361,13 @@ def main():
             "n_ok": n_ok,
             "n_errors": n_errors,
             "n_correct": n_correct,
-            "accuracy_ok_only": accuracy_ok_only,
-            "accuracy_with_errors": accuracy_with_errors,
+            "accuracy_ok_only": (n_correct / n_ok) if n_ok else 0.0,
+            "accuracy_with_errors": (n_correct / n_attempted) if n_attempted else 0.0,
             "length_stops": n_length_stops,
             "prompt_tokens": total_prompt_tokens,
-            "completion_tokens": total_completion_tokens,
+            "output_tokens": total_output_tokens,
             "wall_s": wall_s,
-            "tokens_per_sec_client": (total_completion_tokens / wall_s) if wall_s > 0 else None,
+            "output_tokens_per_sec": (total_output_tokens / wall_s) if wall_s > 0 else None,
             "ttft_ms_p50": _percentile(ttfts, 50),
             "ttft_ms_p90": _percentile(ttfts, 90),
             "ttft_ms_p99": _percentile(ttfts, 99),
@@ -394,10 +387,8 @@ def main():
         f"[{args.out}] fault={fault_mode} "
         f"attempted={n_attempted} ok={n_ok} errors={n_errors} "
         f"acc_ok={r['accuracy_ok_only']:.4f} "
-        f"acc_all={r['accuracy_with_errors']:.4f} "
         f"len_stops={n_length_stops} wall={wall_s:.1f}s "
-        f"ttft_p50={r['ttft_ms_p50']}ms ttft_p90={r['ttft_ms_p90']}ms "
-        f"itl_p50={r['itl_ms_p50']}ms"
+        f"ttft_p50={r['ttft_ms_p50']}ms itl_p50={r['itl_ms_p50']}ms"
     )
 
 if __name__ == "__main__":

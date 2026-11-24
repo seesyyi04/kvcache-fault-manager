@@ -1,3 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kvcache-fault-manager"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["datasets", "openai", "pytest"]
+
+[project.entry-points."vllm.general_plugins"]
+fid01 = "injections.plugin:register"
+
+[tool.setuptools.packages.find]
+include = ["injections*"]          # add your other top-level packages here too
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

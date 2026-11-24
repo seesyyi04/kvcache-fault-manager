@@ -4,7 +4,7 @@ from injections.injectFID01 import (
     Fid01Mode, over_aligned, under_aligned, misaligned, inject_fid01,
 )
 
-BLOCK_SIZE = 64 # vLLM V2 default
+BLOCK_SIZE = 64 # vLLM V2 default; the plugin reads the real value at runtime
 
 """
 Over-aligned
@@ -69,6 +69,10 @@ def test_misaligned_with_explicit_offset():
     # Expected = resume_token_index + 1 = 128 + 1 = 129
     assert misaligned(BLOCK_SIZE*2, BLOCK_SIZE, offset=1) == 129
 
+def test_misaligned_negative_offset():
+    # Offset = 01 -> one token before the boundary
+    assert misaligned(BLOCK_SIZE*2, BLOCK_SIZE, offset=-1) == 127
+
 def test_misaligned_offset_out_of_range():
     r = BLOCK_SIZE * 2
     with pytest.raises(ValueError, match="offset"):
@@ -77,6 +81,11 @@ def test_misaligned_offset_out_of_range():
         misaligned(r, BLOCK_SIZE, offset=-BLOCK_SIZE)
     with pytest.raises(ValueError, match="offset"):
         misaligned(r, BLOCK_SIZE, offset=0)
+
+def test_misaligned_rejects_negative_result():
+    # A negative offset at resume point 0 would give a negative token count.
+    with pytest.raises(ValueError, match="negative"):
+        misaligned(0, BLOCK_SIZE, offset=-1)
 
 def test_misaligned_returns_unaligned():
     for r in (0, 64, 128, 256, 512, 1024):
@@ -90,14 +99,24 @@ def test_misaligned_returns_unaligned():
 dispatch
 """
 def test_dispatch_all_modes():
-    r, block_size = BLOCK_SIZE * 2, BLOCK_SIZE
+    r = BLOCK_SIZE * 2
 
     # Values match direct calls
-    assert inject_fid01(r, block_size, Fid01Mode.OVER_ALIGNED) == 192
-    assert inject_fid01(r, block_size, Fid01Mode.UNDER_ALIGNED) == 64
-    assert inject_fid01(r, block_size, Fid01Mode.MISALIGNED) == 160
+    assert inject_fid01(r, BLOCK_SIZE, Fid01Mode.OVER_ALIGNED) == 192
+    assert inject_fid01(r, BLOCK_SIZE, Fid01Mode.UNDER_ALIGNED) == 64
+    assert inject_fid01(r, BLOCK_SIZE, Fid01Mode.MISALIGNED) == 160
 
     # Dispatch invariant: over/under preserve alignement, misaligned breaks it
-    assert inject_fid01(r, block_size, Fid01Mode.OVER_ALIGNED) % block_size == 0
-    assert inject_fid01(r, block_size, Fid01Mode.UNDER_ALIGNED) % block_size == 0
-    assert inject_fid01(r, block_size, Fid01Mode.MISALIGNED) % block_size != 0
+    assert inject_fid01(r, BLOCK_SIZE, Fid01Mode.OVER_ALIGNED) % BLOCK_SIZE == 0
+    assert inject_fid01(r, BLOCK_SIZE, Fid01Mode.UNDER_ALIGNED) % BLOCK_SIZE == 0
+    assert inject_fid01(r, BLOCK_SIZE, Fid01Mode.MISALIGNED) % BLOCK_SIZE != 0
+
+def test_dispatch_passes_magnitude_through():
+    r = BLOCK_SIZE * 4
+    assert inject_fid01(r, BLOCK_SIZE, Fid01Mode.OVER_ALIGNED, magnitude=2) == r + 2 * BLOCK_SIZE
+    assert inject_fid01(r, BLOCK_SIZE, Fid01Mode.UNDER_ALIGNED, magnitude=3) == r - 3 * BLOCK_SIZE
+    assert inject_fid01(r, BLOCK_SIZE, Fid01Mode.MISALIGNED, magnitude=5) == r + 5
+
+def test_dispatch_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="Unknown fault mode"):
+        inject_fid01(BLOCK_SIZE, BLOCK_SIZE, "over_aligned")

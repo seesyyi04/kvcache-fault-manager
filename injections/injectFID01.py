@@ -1,4 +1,8 @@
 # injections/injectFID01.py
+"""
+Pure arithmetic for wrong prefix-cache resume point.
+There are no vLLM imports here.
+"""
 from enum import Enum, auto
 
 class Fid01Mode(Enum):
@@ -29,7 +33,7 @@ def under_aligned(resume_token_index, block_size, k_blocks=1):
     """
     Resume k whole blocks before the correct point.
     Cache effect: blocks that were already cached get recomputed -> wasteful but
-    produces identical KV values (a "safe" fault).
+    produces identical KV values.
     """
     check_aligned(resume_token_index, block_size)
     if k_blocks < 1:
@@ -40,8 +44,8 @@ def misaligned(resume_token_index, block_size, offset=None):
     """
     Resume at a token index inside the correct block (not on a boundary).
     Cache effect: downstream code slices input_ids at this token but still
-    derives the block table via floor division -> the "which blocks are
-    cached" answer and "how many tokens" answer disagree.
+    derives the block table via floor division -> token count and block
+    table disagree.
 
     offset defaults to +block_size // 2 (mid-block).
     Must satisfy 0 < |offset| < block_size.
@@ -51,7 +55,11 @@ def misaligned(resume_token_index, block_size, offset=None):
         offset = block_size // 2
     if not (0 < abs(offset) < block_size):
         raise ValueError(f"Offset must satisfy 0 < |offset| < {block_size}; offset got {offset}")
-    return resume_token_index + offset
+    result = resume_token_index + offset
+    if result < 0:
+        raise ValueError(f"Misaligned result would be negative ({result}); "
+                         f"Use a positive offset at resume point {resume_token_index}")
+    return result
 
 def inject_fid01(resume_token_index, block_size, mode, magnitude=None):
     """
